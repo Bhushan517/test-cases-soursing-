@@ -610,7 +610,11 @@ export async function updateOffer(request: FastifyRequest, reply: FastifyReply) 
     }
     const jobId = offer.job_id
     if (userType === "vendor") {
-      await checkDistributionStatusForVendor(program_id, userType, jobId, userData, reply, traceId)
+      const result = await checkDistributionStatusForVendor(program_id, userType, jobId, userData, reply, traceId);
+      if (result && result.status_code !== 200) {
+        await transaction?.rollback();
+        return result;
+      }
     }
 
     if (dataToUpdate.status?.toLocaleUpperCase() === "APPROVE") {
@@ -710,8 +714,83 @@ export async function updateOffer(request: FastifyRequest, reply: FastifyReply) 
   }
 }
 
+async function checkDistributionStatusForVendor(program_id: string, userType: string, jobId: any, userData: any[], reply: FastifyReply, traceId: string) {
+  const tenantId = userData?.[0]?.tenant_id;
+  let vendorId: string | undefined;
+  const vendor = await jobRepository.findVendor(program_id, tenantId);
+  vendorId = vendor?.[0]?.id;
+  if (!vendorId) {
+    return {
+      status_code: 400,
+      message: "Vendor not found.",
+      trace_id: traceId,
+    };
+  }
 
+  const distribution = await JobDistributionModel.findOne({
+    where: {
+      job_id: jobId,
+      vendor_id: vendorId,
+      program_id,
+    },
+  });
 
+  const distributionStatus = distribution?.status?.toUpperCase() ?? "";
+
+  if (["HOLD", "HALT"].includes(distributionStatus)) {
+    return {
+      status_code: 400,
+      message: `Job is currently on '${distributionStatus}', offer cannot be created or updated.`,
+      trace_id: traceId,
+    };
+  }
+
+  return { status_code: 200 };
+}
+
+async function processCustomFields(
+  offerId: string,
+  customFields: any[],
+  transaction: Transaction
+) {
+  if (Array.isArray(customFields) && customFields.length > 0) {
+    await Promise.all(
+      customFields.map(async (customField) => {
+        await OfferCustomFieldModel.create(
+          {
+            offer_id: offerId,
+            custom_field_id: customField.id,
+            value: customField.value,
+          },
+          { transaction }
+        );
+      })
+    );
+  }
+}
+
+async function processFoundationalData(offerId: string, foundationalData: any[] | undefined, transaction: Transaction) {
+  if (Array.isArray(foundationalData) && foundationalData.length > 0) {
+
+    await OfferMasterDataModel.destroy({
+      where: { offer_id: offerId },
+      transaction,
+    });
+
+    await Promise.all(
+      foundationalData.map(async (data) => {
+        await OfferMasterDataModel.create(
+          {
+            offer_id: offerId,
+            foundation_data_type_id: data.foundation_data_type_id,
+            foundation_data_ids: data.foundation_data_ids,
+          },
+          { transaction }
+        );
+      })
+    );
+  }
+}
 
 async function approveCounterOffer(offer: any, transaction: any, userId: string) {
 
