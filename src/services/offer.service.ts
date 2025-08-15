@@ -682,7 +682,11 @@ export class OfferService {
         const result = await this.checkDistributionStatusForVendor(program_id, userTypes, jobId, userData, traceId);
         if (result.status_code !== 200) {
           await transaction.rollback();
-          return result;
+          return {
+            status_code: result.status_code,
+            trace_id: result.trace_id,
+            message: result.message || "Distribution check failed",
+          };
         }
       }
 
@@ -1035,7 +1039,7 @@ export class OfferService {
   private async checkDistributionStatusForVendor(program_id: string, userType: string, jobId: any, userData: any[], traceId: string): Promise<{
     status_code: number;
     message?: string;
-    trace_id?: string;
+    trace_id: string;
   }> {
     const tenantId = userData?.[0]?.tenant_id;
     let vendorId: string | undefined;
@@ -1067,7 +1071,7 @@ export class OfferService {
       };
     }
 
-    return { status_code: 200 };
+    return { status_code: 200, trace_id: traceId };
   }
 
   private async validateExistingOffer(offerData: OfferInterface) {
