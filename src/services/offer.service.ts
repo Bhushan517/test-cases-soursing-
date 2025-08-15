@@ -3,12 +3,32 @@ import OfferRepository from "../repositories/offer.repository";
 import { Status } from "../utility/enum/status_enum";
 import JobRepository from "../repositories/job.repository"; // Fixed import
 import { sequelize } from "../config/instance";
-import { QueryTypes } from "sequelize";
+import { QueryTypes, Transaction } from "sequelize";
 import generateCustomUUID from "../utility/genrateTraceId"; // Added missing import
+import { OfferInterface } from "../interfaces/offer.interface";
+import OfferModel from "../models/offer.model";
+import { Op } from "sequelize";
+import SubmissionCandidateModel from "../models/submission-candidate.model";
+import OfferHierachy from "../models/offer-hierarchy.model";
+import OfferCustomFieldModel from "../models/offer-custom-fields.model";
+import OfferMasterDataModel from "../models/offer-master-data.model";
+import { ApprovalworkflowQuery, jobWorkflowQuery } from "../utility/queries";
+import { createWorkflowStepsByChecklistTaskMapping, getSubsequentTrigger, getChecklistTaskMappings, OFFER_CREATION, getBaseTriggersStepCounts } from '../utility/onboarding-util';
+import { credentialingService } from "../external-services/credentialing-service";
+import { fetchManagerIds, workflowTriggering } from "../utility/job_workflow";
+import JobModel from "../models/job.model";
+import { databaseConfig } from '../config/db';
+import { CandidateHistoryService } from "../utility/candidate_history_helper";
+import OfferNotificationService from "../notification/offer-notification-service";
+import { NotificationEventCode } from "../utility/notification-event-code";
+import JobDistributionModel from "../models/job-distribution.model";
 
 // Create instance with proper class name
 const jobRepository = new JobRepository();
 const offerRepository = new OfferRepository(); // Added missing instance
+const config_db = databaseConfig.config.database_config;
+const candidateHistoryService = new CandidateHistoryService(sequelize);
+const offerNotificationService = new OfferNotificationService();
 
 // Added missing interface
 export interface GetOfferByIdResult {
@@ -614,6 +634,610 @@ export class OfferService {
         message: error.message,
         error: error,
       };
+    }
+  }
+
+  async createOffer(request: FastifyRequest, reply: FastifyReply): Promise<{
+    status_code: number;
+    trace_id: string;
+    message: string;
+    id?: string;
+    error?: string;
+  }> {
+    const { program_id } = request.params as { program_id: string };
+    const offer = request.body as OfferInterface;
+    const traceId = generateCustomUUID();
+    const authHeader = request.headers.authorization;
+    const transaction: Transaction = await sequelize.transaction();
+    const user = request.user;
+    const user_id = user?.sub;
+    const userData = await offerRepository.findUser(program_id, user_id);
+
+    try {
+      if (user?.userType !== "super_user" && (!userData || userData.length === 0)) {
+        await transaction?.rollback();
+        return {
+          status_code: 400,
+          trace_id: traceId,
+          message: "User not found",
+        };
+      }
+
+      let userTypes = user?.userType ?? userData[0]?.user_type ?? "";
+      let jobs = await JobModel.findOne({ where: { id: offer.job_id }, transaction });
+
+      if (!jobs) {
+        await transaction.rollback();
+        return {
+          status_code: 400,
+          message: "Job not found",
+          trace_id: traceId,
+        };
+      }
+
+      const holdStatuses = ["HOLD", "PENDING_REVIEW", "DRAFT", "FILLED", "CLOSED", "PENDING_APPROVAL", "REJECTED"];
+      const jobId = jobs.id;
+
+      if (userTypes === "vendor") {
+        const result = await this.checkDistributionStatusForVendor(program_id, userTypes, jobId, userData, traceId);
+        if (result.status_code !== 200) {
+          await transaction.rollback();
+          return result;
+        }
+      }
+
+      if (holdStatuses.includes(jobs?.status)) {
+        await transaction.rollback();
+        return {
+          status_code: 400,
+          message: `Job is currently on ${jobs?.status} offer cannot be created.`,
+          trace_id: traceId,
+        };
+      }
+
+      if (!authHeader?.startsWith('Bearer ')) {
+        await transaction.rollback();
+        return {
+          status_code: 401,
+          message: 'Unauthorized - Token not found',
+          trace_id: traceId,
+        };
+      }
+
+      const token = authHeader.split(' ')[1];
+      const userId = user.sub;
+      const userType = user.userType;
+      const offerData: any = request.body as OfferInterface;
+
+      const offerStartDate = new Date(offer.start_date);
+      const offerEndDate = new Date(offer.end_date);
+
+      if (offerStartDate > offerEndDate) {
+        await transaction.rollback();
+        return {
+          status_code: 400,
+          message: `Offer end date must be greater than the offer start date.`,
+          trace_id: traceId,
+        };
+      }
+
+      if (!offerData.financial_details?.rates) {
+        await transaction.rollback();
+        return {
+          status_code: 400,
+          message: "Financial details cannot be null",
+          trace_id: traceId,
+        };
+      }
+
+      if (!offerData.financial_details?.fee_details) {
+        await transaction.rollback();
+        return {
+          status_code: 400,
+          message: "Fee details cannot be null",
+          trace_id: traceId,
+        };
+      }
+
+      const submission = await SubmissionCandidateModel.findOne({
+        where: {
+          candidate_id: offerData.candidate_id,
+          program_id: program_id,
+          job_id: offerData.job_id
+        },
+        transaction
+      });
+
+      const validStatuses = [
+        Status.PENDING_REHIRE_APPROVAL,
+        Status.PENDING_REHIRE_REVIEW,
+        Status.PENDING_SHORTLIST_REVIEW,
+        Status.WITHDRAW,
+        Status.WITHDRAWN
+      ];
+      const submissionStatus = submission?.dataValues?.status?.toUpperCase() ?? "";
+
+      if (validStatuses.includes(submissionStatus)) {
+        await transaction.rollback();
+        return {
+          status_code: 400,
+          message: `Cannot create offer. Submission is currently in '${submissionStatus}' status.`,
+          trace_id: traceId,
+        };
+      }
+
+      const query = `SELECT * FROM jobs WHERE id = :jobId LIMIT 1;`;
+      const jobRequest: any = await sequelize.query(query, {
+        type: QueryTypes.SELECT,
+        replacements: { jobId: offerData.job_id },
+      });
+
+      let jobDatas = jobRequest[0];
+      if (!jobDatas) {
+        await transaction.rollback();
+        return {
+          status_code: 400,
+          message: "Job not found for the provided job ID.",
+          trace_id: traceId,
+        };
+      }
+
+      // Workflow setup
+      const workflow_job_id = offerData.job_id;
+      const event_slug_base = "create_offer";
+      const module_name_base = "Offers";
+      const type = "workflow";
+      const placement_order = "0";
+      const is_updated = false;
+
+      const parent_offer_id = offerData?.parent_offer_id;
+      const event_slug = parent_offer_id ? "counter_offer" : event_slug_base;
+      const module_name = module_name_base;
+      let moduleId: any;
+
+      if (module_name) {
+        const query = `SELECT id FROM ${config_db}.module WHERE name = :module_name AND is_workflow = true LIMIT 1`;
+        let moduleIds = await sequelize.query(query, {
+          type: QueryTypes.SELECT,
+          replacements: { module_name },
+        });
+        moduleId = moduleIds[0];
+      }
+
+      const module_ids = moduleId?.id ?? "";
+      let eventId: any;
+      if (module_ids && event_slug) {
+        const query = `SELECT id FROM ${config_db}.event WHERE module_id = :module_ids AND slug = :event_slug AND is_enabled = true AND type = :type LIMIT 1`;
+        const eventIdData = await sequelize.query(query, {
+          type: QueryTypes.SELECT,
+          replacements: {
+            module_ids,
+            event_slug,
+            type
+          },
+        });
+        eventId = eventIdData[0];
+      }
+
+      const module_id = module_ids ?? jobDatas.module_id;
+      const event_id = eventId?.id ?? "";
+      const workflowQuery2 = jobWorkflowQuery(jobDatas.hierarchy_ids);
+      const rows: any[] = await sequelize.query(workflowQuery2, {
+        replacements: { module_id, event_id, program_id, placement_order },
+        type: QueryTypes.SELECT,
+      });
+
+      if (offerData.status?.toLocaleUpperCase() !== 'DRAFT') {
+        if (rows.length > 0 || rows[0]?.levels > 0) {
+          const hasReviewFlow = rows.some(row => row.flow_type.trim() === 'Review');
+          if (offerData.parent_offer_id) {
+            offerData.status = hasReviewFlow ? "Pending Review" : "Pending Approval";
+            const parentOffer = await OfferModel.findByPk(offerData.parent_offer_id);
+            if (parentOffer) {
+              await parentOffer.update({ status: "CLOSED" }, { transaction });
+              await submission?.update({ status: `Counter Offer ${offerData.status}` });
+            }
+          } else {
+            offerData.status = hasReviewFlow ? "Pending Review" : "Pending Approval";
+            await submission?.update({ status: `Offer ${offerData.status}` });
+          }
+        } else {
+          if (offerData.parent_offer_id) {
+            const parentOffer = await OfferModel.findByPk(offerData.parent_offer_id);
+            const oldStatus = parentOffer?.dataValues.status;
+            if (parentOffer) {
+              await parentOffer.update({ status: "CLOSED" }, { transaction });
+              await submission?.update({ status: `Counter Offer Pending Approval` });
+              offerData.status = "Pending Approval";
+              offerData.is_workflow = true;
+              const newStatus = `Counter Offer ${offerData.status}`;
+              const oldData = { status: oldStatus, candidate_id: submission?.dataValues.candidate_id, job_id: submission?.dataValues.job_id, updated_by: userId };
+              const newData = { status: newStatus, candidate_id: submission?.dataValues.candidate_id, job_id: submission?.dataValues.job_id, updated_by: userId };
+              const action = offerData.parent_offer_id ? 'Counter Offer Created' : 'Offer Created';
+              await candidateHistoryService.handleCandidateHistory({ program_id, oldData, newData, action });
+            }
+          } else {
+            offerData.status = "Pending Acceptance";
+            await submission?.update({ status: `Offer ${offerData.status}` });
+          }
+        }
+      }
+
+      const isUpdate = !!offerData.id;
+      const existingOffer = await this.validateExistingOffer(offerData);
+      if (!isUpdate || (isUpdate && !existingOffer)) {
+        if (existingOffer) {
+          await transaction.rollback();
+          return {
+            status_code: 400,
+            trace_id: traceId,
+            message: existingOffer.message,
+            id: existingOffer.id,
+          };
+        }
+      }
+
+      const [newItem] = await OfferModel.upsert(
+        {
+          ...offerData, program_id, vendor_id: submission?.vendor_id, updated_by: userId, created_by: userId, created_on: Date.now(), updated_on: Date.now(),
+          checklist_entity_id: offerData.checklist_entity_id ?? submission?.checklist_entity_id ?? null,
+          checklist_version: offerData.checklist_version ?? submission?.checklist_version ?? null,
+          onboarding_flow_id: submission?.onboarding_flow_id ?? null,
+        },
+        { transaction }
+      );
+
+      const oldData = {
+        status: null,
+        candidate_id: newItem?.dataValues.candidate_id,
+        job_id: newItem?.dataValues.job_id,
+        updated_by: userId,
+      };
+
+      if (newItem.dataValues.status?.toUpperCase() === "PENDING ACCEPTANCE") {
+        const newData = {
+          candidate_id: newItem?.dataValues.candidate_id,
+          status: newItem?.dataValues.status,
+          job_id: newItem?.dataValues?.job_id,
+          updated_by: newItem?.dataValues.updated_by
+        };
+        await candidateHistoryService.handleCandidateHistory({ program_id, oldData, newData, action: 'Offer Created', });
+        offerNotificationService.processAndSendOfferNotification(
+          token, reply, program_id, newItem, jobDatas, sequelize, user, traceId, offerData, NotificationEventCode.OFFER_RELEASED
+        );
+      } else {
+        offerNotificationService.processAndSendOfferNotification(token, reply, program_id, newItem, jobDatas, sequelize, user, traceId, offerData, NotificationEventCode.OFFER_CREATE);
+        const newData = {
+          candidate_id: newItem?.dataValues.candidate_id,
+          status: newItem?.dataValues.status,
+          job_id: newItem?.dataValues?.job_id,
+          updated_by: newItem?.dataValues.updated_by
+        };
+        await candidateHistoryService.handleCandidateHistory({ program_id, oldData, newData, action: 'Offer Created', });
+      }
+
+      const hierarchyIds = jobs.hierarchy_ids ?? [];
+
+      if (newItem?.onboarding_flow_id) {
+        await this.processOnboardingFlow(jobDatas, newItem, program_id, request, transaction, traceId, hierarchyIds);
+      }
+
+      let jobData = offerData;
+      jobData.userId = userId;
+      jobData.userType = userType;
+
+      let job = { event_title: jobDatas.job_id, job_id: newItem.dataValues.job_id, id: newItem.dataValues.id };
+
+      await sequelize.query(`SELECT job_id FROM jobs WHERE id = :job_id;`, {
+        replacements: { job_id: newItem.dataValues.job_id },
+        type: QueryTypes.SELECT
+      }) as [{ job_id: string }];
+
+      if (offerData.hierarchy && Array.isArray(offerData.hierarchy)) {
+        for (const hierarchyId of offerData.hierarchy) {
+          await OfferHierachy.create(
+            {
+              offer_id: newItem.id,
+              hierarchy: hierarchyId,
+            },
+            { transaction }
+          );
+        }
+      }
+
+      try {
+        await this.processCustomFields(newItem.id, offerData.custom_fields, transaction);
+        await this.processFoundationalData(newItem.id, offerData.foundational_data, transaction);
+        const job_max_bill_rate = jobData.financial_details?.rates[0]?.rate_configuration[0]?.base_rate?.clientBillRate?.max_rate;
+        const offer_max_bill_rate = jobData.financial_details?.rates[0]?.rate_configuration[0]?.base_rate?.client_bill_rate;
+        let is_offer_rate_greater = false;
+
+        if (Number(offer_max_bill_rate) > Number(job_max_bill_rate)) {
+          is_offer_rate_greater = true;
+        }
+
+        const managers = await fetchManagerIds(offerData);
+
+        jobData.is_offer_rate_greater = is_offer_rate_greater;
+        jobData.job_managers = managers?.job_manager_id;
+        jobData.timesheet_manager_id = managers?.timesheet_manager_id;
+        jobData.expense_manager_id = managers?.expense_manager_id;
+        jobData.duration = jobData?.financial_details?.billRateValue?.duration_in_days;
+        jobData.offer_budget = jobData?.financial_details?.billRateValue?.budget;
+        jobDatas.is_offer_rate_greater = is_offer_rate_greater;
+        const weekCount = parseInt(offerData?.financial_details?.billRateValue?.formatted_weeks_days?.match(/(\d+)\s+Weeks?/)?.[1] || "0");
+        jobData.duration = weekCount;
+        jobDatas.duration = weekCount;
+        const workflow = await workflowTriggering(request, reply, program_id, rows, job, jobData, jobDatas, module_name, is_updated, workflow_job_id, event_slug);
+        const offers = await OfferModel.findOne({
+          where: {
+            id: newItem.id,
+          },
+          transaction
+        });
+
+        if (!workflow) {
+          const workflowQuery2 = ApprovalworkflowQuery(jobDatas.hierarchy_ids);
+          const rows: any[] = await sequelize.query(workflowQuery2, {
+            replacements: { module_id, event_id, program_id, placement_order },
+            type: QueryTypes.SELECT,
+            transaction
+          });
+
+          const workflow = await workflowTriggering(request, reply, program_id, rows, job, jobData, jobDatas, module_name, is_updated, workflow_job_id, event_slug);
+
+          if (!workflow) {
+            if (!offerData.parent_offer_id) {
+              await submission?.update({ status: "Offer Pending Acceptance" }, { transaction });
+              await offers?.update({ status: "Pending Acceptance" }, { transaction });
+            } else {
+              await submission?.update({ status: "Counter Offer Pending Approval" }, { transaction });
+              await offers?.update({ status: "Pending Approval" }, { transaction });
+            }
+          } else {
+            await submission?.update({ status: "Offer Pending Approval" }, { transaction });
+            await offers?.update({ status: "Pending Approval" }, { transaction });
+          }
+        }
+
+        if (workflow?.workflow?.workflow_status === "completed") {
+          await submission?.update({ status: "Offer Pending Acceptance" }, { transaction });
+          await offers?.update({ status: "Pending Acceptance" }, { transaction });
+        }
+
+      } catch (error) {
+        console.log('error is mwww', error);
+      }
+
+      await transaction.commit();
+
+      return {
+        status_code: 201,
+        trace_id: traceId,
+        message: "Offer created successfully.",
+        id: newItem?.id,
+      };
+
+    } catch (error: any) {
+      if (transaction) {
+        await transaction.rollback();
+      }
+
+      return {
+        status_code: 500,
+        trace_id: traceId,
+        message: error.message,
+        error: error.message,
+      };
+    }
+  }
+
+  private async checkDistributionStatusForVendor(program_id: string, userType: string, jobId: any, userData: any[], traceId: string): Promise<{
+    status_code: number;
+    message?: string;
+    trace_id?: string;
+  }> {
+    const tenantId = userData?.[0]?.tenant_id;
+    let vendorId: string | undefined;
+    const vendor = await jobRepository.findVendor(program_id, tenantId);
+    vendorId = vendor?.[0]?.id;
+    if (!vendorId) {
+      return {
+        status_code: 400,
+        message: "Vendor not found.",
+        trace_id: traceId,
+      };
+    }
+
+    const distribution = await JobDistributionModel.findOne({
+      where: {
+        job_id: jobId,
+        vendor_id: vendorId,
+        program_id,
+      },
+    });
+
+    const distributionStatus = distribution?.status?.toUpperCase() ?? "";
+
+    if (["HOLD", "HALT"].includes(distributionStatus)) {
+      return {
+        status_code: 400,
+        message: `Job is currently on '${distributionStatus}', offer cannot be created or updated.`,
+        trace_id: traceId,
+      };
+    }
+
+    return { status_code: 200 };
+  }
+
+  private async validateExistingOffer(offerData: OfferInterface) {
+    let offer;
+    if (offerData.parent_offer_id == null) {
+      const offer = await OfferModel.findOne({
+        where: {
+          job_id: offerData.job_id,
+          candidate_id: offerData.candidate_id,
+          status: {
+            [Op.ne]: "Withdraw",
+          },
+        },
+      });
+      if (offer) {
+        return {
+          message: "Offer already exists for this candidate and job!",
+          id: offer.id,
+        };
+      }
+    } else {
+      offer = await OfferModel.findOne({
+        where: {
+          job_id: offerData.job_id,
+          candidate_id: offerData.candidate_id,
+          parent_offer_id: offerData.parent_offer_id,
+          status: {
+            [Op.notIn]: ["Withdraw", "CLOSED"],
+          }
+        },
+      });
+      if (offer) {
+        return {
+          message: "Counter offer already exists for this candidate and job!",
+          id: offer.id,
+        };
+      }
+    }
+    return null;
+  }
+
+  private async processCustomFields(
+    offerId: string,
+    customFields: any[],
+    transaction: Transaction
+  ) {
+    if (Array.isArray(customFields) && customFields.length > 0) {
+      await Promise.all(
+        customFields.map(async (customField) => {
+          await OfferCustomFieldModel.create(
+            {
+              offer_id: offerId,
+              custom_field_id: customField.id,
+              value: customField.value,
+            },
+            { transaction }
+          );
+        })
+      );
+    }
+  }
+
+  private async processFoundationalData(offerId: string, foundationalData: any[] | undefined, transaction: Transaction) {
+    if (Array.isArray(foundationalData) && foundationalData.length > 0) {
+
+      await OfferMasterDataModel.destroy({
+        where: { offer_id: offerId },
+        transaction,
+      });
+
+      await Promise.all(
+        foundationalData.map(async (data) => {
+          await OfferMasterDataModel.create(
+            {
+              offer_id: offerId,
+              foundation_data_type_id: data.foundation_data_type_id,
+              foundation_data_ids: data.foundation_data_ids,
+            },
+            { transaction }
+          );
+        })
+      );
+    }
+  }
+
+  private async processOnboardingFlow(job: { job_id: any; id: any; job_template_id: string; }, offer: OfferModel, program_id: string, request: FastifyRequest, transaction: Transaction, traceId: string, hierarchy_ids: string[]) {
+    const onboarding_flow_id = offer.onboarding_flow_id;
+    const jobTemplateQuery = `
+      SELECT template_name, id, job_id
+      FROM ${config_db}.job_templates
+      WHERE id = :job_template_id
+      LIMIT 1;
+    `;
+    const jobTemplateResult = await sequelize.query(jobTemplateQuery, {
+      replacements: { job_template_id: job.job_template_id },
+      type: QueryTypes.SELECT,
+
+    });
+
+    const jobTemplate: any = jobTemplateResult[0];
+
+    const vendorQuery = `
+            SELECT id, vendor_name, tenant_id
+            FROM ${config_db}.program_vendors
+            WHERE id = :vendor_id
+            `;
+
+    const [vendor]: any = await sequelize.query(vendorQuery, {
+      replacements: { vendor_id: offer.vendor_id },
+      type: QueryTypes.SELECT
+    });
+
+    try {
+      let triggers = [OFFER_CREATION, ...getSubsequentTrigger(OFFER_CREATION)];
+
+      const checklistTaskMappings = await getChecklistTaskMappings({ checklist_entity_id: offer.checklist_entity_id, checklist_version: offer.checklist_version, triggers });
+
+      const triggerStepCounts = checklistTaskMappings.reduce((acc: Record<string, number>, ctm: any) => {
+        acc[`${ctm.trigger}_steps_count`]++;
+        return acc;
+      }, getBaseTriggersStepCounts(triggers));
+
+      const workflowUpdates = {
+        associations: {
+          offer_id: offer.id,
+          offer_code: offer.offer_code
+        },
+        attributes: {
+          ...triggerStepCounts
+        }
+      };
+
+      // Call to create workflow steps by checklist task mapping
+      const workflowSteps = await createWorkflowStepsByChecklistTaskMapping(
+        checklistTaskMappings.filter((mapping: any) => mapping.trigger == OFFER_CREATION),
+        program_id,
+        offer.candidate_id,
+        hierarchy_ids,
+        vendor.tenant_id,
+        {
+          job_template_id: jobTemplate.id,
+          job_template_code: jobTemplate.job_id,
+          job_id: job.id,
+          job_code: job.job_id,
+          offer_id: offer.id,
+          offer_code: offer.offer_code,
+        }
+      );
+
+      const onboarding_flow_updates = {
+        workflow: workflowUpdates,
+        steps: workflowSteps
+      };
+
+      try {
+        const credentialing_result = await credentialingService.pushWorkflowUpdatesAndAppendSteps(
+          onboarding_flow_id,
+          onboarding_flow_updates,
+          program_id,
+          request.headers?.authorization!
+        );
+
+        console.log("Workflow updated and possible workflow steps appended successfully in credentialing:", credentialing_result);
+      } catch (error: any) {
+        console.error("Error updating workflow  or appending steps in credentialing service:", error);
+        throw new Error("Failed to add onboarding steps");
+      }
+    } catch (error: any) {
+      console.error("Error creating workflow steps:", error);
+      throw new Error("Failed to create workflow steps.");
     }
   }
 }
